@@ -1,162 +1,83 @@
 /**
- * PROJECT: Al Gash Basin - Professional Multi-Index Dashboard
- * INDICES: MNDWI (Water), NDVI (Veg), BSI (Soil)
- * COMPONENTS: Interactive Map, Layer Toggles, Peak Month Reporting, Comparative Chart
+ * PROJECT: Al Gash Basin – Environmental Spectral Analysis
+ * PURPOSE: Automated extraction of MNDWI, NDVI, and BSI indices.
+ * METHODOLOGY: Multi-sensor processing with strict temporal filtering.
  */
 
-// 1. ROI & INITIAL VIEW SETUP
-var roi = ee.FeatureCollection('projects/ee-asiahamdi1/assets/Gash_basin');
-Map.centerObject(roi, 11);
-Map.setOptions('HYBRID');
+var roi = ee.FeatureCollection('projects/beaming-set-482612-c2/assets/Algash_basin_utm37');
+Map.centerObject(roi, 10);
 
-// 2. PRE-PROCESSING FUNCTIONS (Landsat & Sentinel)
-// Cloud masking and scaling for Landsat
-function cleanL(img) {
-  var qa = img.select('QA_PIXEL');
-  var mask = qa.bitwiseAnd(1 << 3).or(qa.bitwiseAnd(1 << 4)).or(qa.bitwiseAnd(1 << 1)).eq(0);
-  return ee.Image(img.updateMask(mask).multiply(0.0000275).add(-0.2)
-            .copyProperties(img, ['system:time_start'])).clip(roi);
-}
-
-// Cloud masking and scaling for Sentinel-2
-function cleanS2(img) {
-  var qa = img.select('QA60');
-  var mask = qa.bitwiseAnd(1 << 10).eq(0).and(qa.bitwiseAnd(1 << 11).eq(0));
-  return ee.Image(img.updateMask(mask).divide(10000)
-            .copyProperties(img, ['system:time_start'])).clip(roi);
-}
-
-// 3. MULTI-INDEX CORE ENGINE (Includes Peak Month Detection)
-var getYearlyPeak = function(year, collectionId, maskFunc, bands) {
-  var dateStart = year + '-01-01';
-  var dateEnd = year + '-12-31';
+// Function to calculate indices and extract metadata per epoch
+var getIndices = function(year) {
+  var start = (year === 2005) ? ee.Date.fromYMD(2004, 5, 1) : ee.Date.fromYMD(year, 7, 1);
+  var end = (year === 2005) ? ee.Date.fromYMD(2006, 10, 31) : ee.Date.fromYMD(year, 10, 31);
   
-  var collection = ee.ImageCollection(collectionId)
-    .filterBounds(roi)
-    .filterDate(dateStart, dateEnd)
-    .filter(ee.Filter.notNull(['system:time_start']))
-    .map(maskFunc);
-    
-  var processedCol = collection.map(function(img) {
-    // Calculate MNDWI (Water)
-    var mndwi = img.normalizedDifference([bands.green, bands.swir1]).rename('MNDWI');
-    // Calculate NDVI (Vegetation)
-    var ndvi = img.normalizedDifference([bands.nir, bands.red]).rename('NDVI');
-    // Calculate BSI (Bare Soil Index)
-    var bsi = img.expression(
-      '((SW1 + R) - (NIR + B)) / ((SW1 + R) + (NIR + B))', {
-        'SW1': img.select(bands.swir1),
-        'R': img.select(bands.red),
-        'NIR': img.select(bands.nir),
-        'B': img.select(bands.blue)
-      }).rename('BSI');
-    
-    // Add a constant band representing the month of the image
-    var month = ee.Image.constant(ee.Date(img.get('system:time_start')).get('month')).rename('month');
-      
-    return img.addBands([mndwi.float(), ndvi.float(), bsi.float(), month.float()]);
-  });
-
-  // Create a Quality Mosaic based on the highest Water Index (Peak Flood)
-  var peakImage = processedCol.qualityMosaic('MNDWI');
+  var col, img, bands, sensorName;
   
-  // Calculate stats and identify the month where the peak occurred
-  var stats = peakImage.select(['MNDWI', 'NDVI', 'BSI', 'month']).reduceRegion({
-    reducer: ee.Reducer.median(),
-    geometry: roi.geometry().bounds(),
-    scale: 1000, 
-    maxPixels: 1e9
-  });
+  // Define sensor parameters and band combinations per era
+  if (year < 1999) { 
+    sensorName = 'Landsat 5 TM';
+    col = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2").filterBounds(roi).filterDate(start, end).filter(ee.Filter.lt('CLOUD_COVER', 40));
+    img = col.map(function(i){return i.multiply(0.0000275).add(-0.2).clip(roi)}).median();
+    bands = {mndwi: ['SR_B2', 'SR_B5'], ndvi: ['SR_B4', 'SR_B3'], bsi_sw: 'SR_B5', bsi_r: 'SR_B3', bsi_nir: 'SR_B4', bsi_b: 'SR_B1'};
+  } else if (year < 2013) { 
+    sensorName = 'Landsat 7 ETM+';
+    col = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2").filterBounds(roi).filterDate(start, end).filter(ee.Filter.lt('CLOUD_COVER', 40));
+    img = col.map(function(i){return i.multiply(0.0000275).add(-0.2).clip(roi)}).median();
+    bands = {mndwi: ['SR_B2', 'SR_B5'], ndvi: ['SR_B4', 'SR_B3'], bsi_sw: 'SR_B5', bsi_r: 'SR_B3', bsi_nir: 'SR_B4', bsi_b: 'SR_B1'};
+  } else if (year < 2020) { 
+    sensorName = 'Landsat 8 OLI';
+    col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").filterBounds(roi).filterDate(start, end).filter(ee.Filter.lt('CLOUD_COVER', 40));
+    img = col.map(function(i){return i.multiply(0.0000275).add(-0.2).clip(roi)}).median();
+    bands = {mndwi: ['SR_B3', 'SR_B6'], ndvi: ['SR_B5', 'SR_B4'], bsi_sw: 'SR_B6', bsi_r: 'SR_B4', bsi_nir: 'SR_B5', bsi_b: 'SR_B2'};
+  } else { 
+    sensorName = 'Sentinel-2 MSI';
+    col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(roi).filterDate(start, end).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40));
+    img = col.map(function(i){return i.divide(10000).clip(roi)}).median();
+    bands = {mndwi: ['B3', 'B11'], ndvi: ['B8', 'B4'], bsi_sw: 'B11', bsi_r: 'B4', bsi_nir: 'B8', bsi_b: 'B2'};
+  }
 
-  var monthNum = ee.Number(stats.get('month')).round();
-  
-  // Print the professional report to the Console
-  print('--- Yearly Analysis: ' + year + ' ---');
-  print('Peak Water Value (MNDWI):', stats.get('MNDWI'));
-  print('Peak Occurrence Month:', monthNum); // Displays the month (1-12)
-  print('Vegetation at Peak (NDVI):', stats.get('NDVI'));
+  // Calculate spectral indices
+  var mndwi = img.normalizedDifference(bands.mndwi).rename('MNDWI');
+  var ndvi = img.normalizedDifference(bands.ndvi).rename('NDVI');
+  var bsi = img.expression('((SW+R)-(NIR+B))/((SW+R)+(NIR+B))', {
+    'SW': img.select(bands.bsi_sw), 'R': img.select(bands.bsi_r), 'NIR': img.select(bands.bsi_nir), 'B': img.select(bands.bsi_b)
+  }).rename('BSI');
 
-  return peakImage.set('year_label', year)
-                  .set('MNDWI_v', stats.get('MNDWI'))
-                  .set('NDVI_v', stats.get('NDVI'))
-                  .set('BSI_v', stats.get('BSI'))
-                  .set('peak_month', monthNum)
-                  .set('system:time_start', ee.Date(dateStart).millis());
+  return {mndwi: mndwi, ndvi: ndvi, bsi: bsi, sensor: sensorName, count: col.size(), start: start, end: end};
 };
 
-// 4. DATA GENERATION (Landsat 5, 7, 8 & Sentinel 2)
-var lBands = {blue: 'SR_B1', green: 'SR_B2', red: 'SR_B3', nir: 'SR_B4', swir1: 'SR_B5'};
-var l8Bands = {blue: 'SR_B2', green: 'SR_B3', red: 'SR_B4', nir: 'SR_B5', swir1: 'SR_B6'};
-var s2Bands = {blue: 'B2', green: 'B3', red: 'B4', nir: 'B8', swir1: 'B11'};
-
-var p1985 = getYearlyPeak('1985', "LANDSAT/LT05/C02/T1_L2", cleanL, lBands);
-var p1995 = getYearlyPeak('1995', "LANDSAT/LT05/C02/T1_L2", cleanL, lBands);
-var p2005 = getYearlyPeak('2005', "LANDSAT/LE07/C02/T1_L2", cleanL, lBands);
-var p2015 = getYearlyPeak('2015', "LANDSAT/LC08/C02/T1_L2", cleanL, l8Bands);
-var p2025 = getYearlyPeak('2025', "COPERNICUS/S2_SR_HARMONIZED", cleanS2, s2Bands);
-
-// 5. MAP LAYERS SETUP
 var years = [1985, 1995, 2005, 2015, 2025];
-var peaks = [p1985, p1995, p2005, p2015, p2025];
-var colors = ['#FF0000', '#FFA500', '#FFFF00', '#00FF00', '#00FFFF']; 
+var features = [];
 
-for (var i = 0; i < 5; i++) {
-  // Add Water Layer (Visible by default)
-  var water = peaks[i].select('MNDWI');
-  Map.addLayer(water.updateMask(water.gt(0.2)), {palette: [colors[i]]}, 'Peak Water ' + years[i], true);
-  
-  // Add Vegetation Layer (Hidden by default - click checkbox to see)
-  var veg = peaks[i].select('NDVI');
-  Map.addLayer(veg.updateMask(veg.gt(0.3)), {palette: ['#edf8e9','#bae4b3','#74c476','#238b45']}, 'Vegetation ' + years[i], false);
-  
-  // Add Soil Layer (Hidden by default - click checkbox to see)
-  var soil = peaks[i].select('BSI');
-  Map.addLayer(soil.updateMask(soil.gt(0.1)), {palette: ['#fee391','#fec44f','#fe9929','#cc4c02']}, 'Soil Index ' + years[i], false);
-}
-
-// 6. VISUAL LEGEND (UI PANEL)
-var legend = ui.Panel({
-  style: {position: 'bottom-left', padding: '10px', border: '1px solid grey'}
-});
-legend.add(ui.Label({value: 'Peak Water Years', style: {fontWeight: 'bold', fontSize: '16px'}}));
-
-var makeRow = function(color, text) {
-  var colorBox = ui.Label({style: {backgroundColor: color, padding: '8px', border: '1px solid black'}});
-  var label = ui.Label({value: text, style: {margin: '0 0 4px 6px'}});
-  return ui.Panel({widgets: [colorBox, label], layout: ui.Panel.Layout.Flow('horizontal')});
-};
-
-for (var j = 0; j < 5; j++) { legend.add(makeRow(colors[j], years[j])); }
-Map.add(legend);
-
-// 7. COMPARATIVE CHART
-var chartData = ee.FeatureCollection(ee.List(peaks).map(function(img){
-  var i = ee.Image(img);
-  return ee.Feature(null, {
-    'Year': i.get('year_label'), 
-    'Water (MNDWI)': i.get('MNDWI_v'), 
-    'Veg (NDVI)': i.get('NDVI_v'), 
-    'Soil (BSI)': i.get('BSI_v')
+// Iterate through years to generate reports, charts, and export tasks
+years.forEach(function(y) {
+  var data = getIndices(y);
+  var stats = ee.Image.cat([data.mndwi, data.ndvi, data.bsi]).reduceRegion({
+    reducer: ee.Reducer.median(), geometry: roi, scale: 30, maxPixels: 1e13
   });
-}));
-
-var chart = ui.Chart.feature.byFeature({
-  features: chartData,
-  xProperty: 'Year', 
-  yProperties: ['Water (MNDWI)', 'Veg (NDVI)', 'Soil (BSI)']
-}).setChartType('LineChart').setOptions({
-  title: 'Al Gash Basin: Spectral Trends (1985-2025)',
-  colors: ['#2563eb', '#16a34a', '#92400e'],
-  lineWidth: 3, pointSize: 7
+  
+  // Console logging for methodology documentation
+  print('--- Report for Year: ' + y + ' ---');
+  print('Sensor Name: ' + data.sensor);
+  print('Temporal Coverage: ' + data.start.format('YYYY-MM-dd').getInfo() + ' to ' + data.end.format('YYYY-MM-dd').getInfo());
+  print('Image Collection Size: ' + data.count.getInfo());
+  print('Median Spectral Indices: ', stats);
+  
+  features.push(ee.Feature(null, {year: y, MNDWI: stats.get('MNDWI'), NDVI: stats.get('NDVI'), BSI: stats.get('BSI')}));
+  
+  // Export individual index files for local analysis
+  Export.image.toDrive({image: data.mndwi.float(), description: 'MNDWI_' + y, scale: 30, region: roi.geometry(), maxPixels: 1e13});
+  Export.image.toDrive({image: data.ndvi.float(), description: 'NDVI_' + y, scale: 30, region: roi.geometry(), maxPixels: 1e13});
+  Export.image.toDrive({image: data.bsi.float(), description: 'BSI_' + y, scale: 30, region: roi.geometry(), maxPixels: 1e13});
 });
+
+// Generate comparative trend chart
+var chart = ui.Chart.feature.byFeature(ee.FeatureCollection(features), 'year', ['MNDWI', 'NDVI', 'BSI'])
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Multi-Temporal Spectral Indices Trend (1985-2025)',
+    hAxis: {title: 'Year'}, vAxis: {title: 'Median Value'},
+    lineWidth: 2, pointSize: 4
+  });
 print(chart);
-
-// 8. EXPORT TO GOOGLE DRIVE
-for (var k = 0; k < 5; k++) {
-  Export.image.toDrive({
-    image: peaks[k].select(['MNDWI', 'NDVI', 'BSI', 'month']),
-    description: 'Gash_Analysis_' + years[k],
-    folder: 'Gash_Basin_Project',
-    scale: 30, region: roi.geometry().bounds(), maxPixels: 1e9
-  });
-}
