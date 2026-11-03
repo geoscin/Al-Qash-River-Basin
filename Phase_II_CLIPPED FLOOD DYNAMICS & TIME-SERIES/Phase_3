@@ -1,0 +1,175 @@
+/**
+ * =================================================================
+ * PHASE III: CLIPPED FLOOD DYNAMICS & TIME-SERIES
+ * -----------------------------------------------------------------
+ * GIS Specialist: Asia Hamdi
+ * Features: Strict Clipping, Otsu, Discrete Legends, Annual Charts
+ * Status: River Centerline Removed
+ * =================================================================
+ */
+
+// --- SECTION 1: SETTINGS & STUDY AREA ---
+var studyArea = ee.FeatureCollection('projects/beaming-set-482612-c2/assets/Algash_basin_utm37').geometry();
+var years = ee.List.sequence(2020, 2025); 
+
+// --- SECTION 2: AUTOMATED OTSU FUNCTION (Chunk 10) ---
+var computeOtsuThreshold = function(image) {
+  var histogram = image.reduceRegion({
+    reducer: ee.Reducer.histogram(255, 2).combine('mean', null, true).combine('variance', null, true),
+    geometry: studyArea, 
+    scale: 30, 
+    bestEffort: true
+  });
+  var counts = ee.Array(ee.Dictionary(histogram.get('VV_filtered_histogram')).get('histogram'));
+  var means = ee.Array(ee.Dictionary(histogram.get('VV_filtered_histogram')).get('bucketMeans'));
+  var bss = ee.List.sequence(1, counts.length().get([0])).map(function(i) {
+    var aCounts = counts.slice(0, i);
+    var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans = means.slice(0, i);
+    var aMean = aMeans.multiply(aCounts).reduce(ee.Reducer.sum(), [0]).get([0]).divide(aCount);
+    var bCount = counts.reduce(ee.Reducer.sum(), [0]).get([0]).subtract(aCount);
+    var bMean = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]).subtract(aMean.multiply(aCount)).divide(bCount);
+    return aCount.multiply(bCount).multiply(aMean.subtract(bMean).pow(2));
+  });
+  return means.get([ee.List(bss).indexOf(ee.List(bss).reduce(ee.Reducer.max()))]);
+};
+
+// --- SECTION 3: CHUNK 13 - ANNUAL TIME-SERIES (STRICT CLIPPING) ---
+var annualStats = years.map(function(year) {
+  var col = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(studyArea)
+    .filterDate(ee.Date.fromYMD(year, 6, 1), ee.Date.fromYMD(year, 10, 31))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .map(function(img) { 
+      return img.select(['VV']).focal_mean(30, 'circle', 'meters')
+                .rename('VV_filtered').clip(studyArea); 
+    });
+  
+  var otsu = computeOtsuThreshold(col.median());
+  var maxExtent = col.map(function(img) { return img.lt(otsu); }).max().clip(studyArea);
+  
+  var area = maxExtent.selfMask().multiply(ee.Image.pixelArea()).reduceRegion({
+    reducer: ee.Reducer.sum(), 
+    geometry: studyArea, 
+    scale: 30, 
+    maxPixels: 1e13
+  }).get('VV_filtered');
+  
+  return ee.Feature(null, {'year': year, 'area_m2': area});
+});
+
+// --- SECTION 4: CURRENT YEAR LAYERS (2024 - CLIPPED) ---
+var currentColl = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(studyArea)
+    .filterDate('2024-06-01', '2024-10-31')
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .map(function(img) { 
+      return img.select(['VV']).focal_mean(30, 'circle', 'meters')
+                .rename('VV_filtered').clip(studyArea); 
+    });
+
+var otsu2024 = computeOtsuThreshold(currentColl.median());
+
+// Calculations for Chunks 11, 12, 13
+var freq = currentColl.map(function(img){ return img.lt(otsu2024).rename('f'); })
+                      .sum().divide(currentColl.size()).multiply(100).clip(studyArea);
+
+var persistence = currentColl.map(function(img){ return img.lt(otsu2024); })
+                             .sum().clip(studyArea);
+
+var maxExt = currentColl.map(function(img){ return img.lt(otsu2024); })
+                        .max().selfMask().clip(studyArea);
+
+// --- SECTION 5: VISUALIZATION ---
+Map.setOptions('SATELLITE');
+Map.centerObject(studyArea, 10);
+
+// Add Layers (Selective activation)
+Map.addLayer(freq.updateMask(freq.gt(10)), {min: 13.6, max: 24.1, palette: ["ebf3fb","08306b"]}, '1. Flood Frequency', true);
+Map.addLayer(persistence.updateMask(persistence.gt(1)), {min: 1, max: 10, palette: ['yellow', 'orange', 'red']}, '2. Inundation Persistence', false);
+Map.addLayer(maxExt, {palette: ['#000080']}, '3. Annual Max Extent', false);
+
+// --- SECTION 6: DISCRETE LEGENDS UI ---
+var makeLegend = function(title, colorMap) {
+  var panel = ui.Panel({style: {padding: '8px', margin: '5px', border: '1px solid #ccc'}});
+  panel.add(ui.Label(title, {fontWeight: 'bold', fontSize: '14px'}));
+  Object.keys(colorMap).forEach(function(key) {
+    var row = ui.Panel({layout: ui.Panel.Layout.Flow('horizontal')});
+    row.add(ui.Label('', {backgroundColor: colorMap[key], padding: '8px', margin: '2px'}));
+    row.add(ui.Label(key, {fontSize: '12px', margin: '4px'}));
+    panel.add(row);
+  });
+  return panel;
+};
+
+var mainPanel = ui.Panel({style: {position: 'bottom-left', width: '200px'}});
+mainPanel.add(makeLegend('Flood Frequency', {'High': '#08306b', 'Low': '#ebf3fb'}));
+mainPanel.add(makeLegend('Persistence', {'High Stay': 'red', 'Medium': 'orange', 'Low': 'yellow'}));
+mainPanel.add(makeLegend('Inundation', {'Max Boundary': '#000080'}));
+Map.add(mainPanel);
+
+// --- SECTION 7: CHARTS & STATS ---
+var chart = ui.Chart.feature.byFeature(ee.FeatureCollection(annualStats), 'year', 'area_m2')
+  .setOptions({
+    title: 'Annual Flood Area Time-Series (2020-2025)',
+    hAxis: {title: 'Year', format: '####'},
+    vAxis: {title: 'Area (m2)'},
+    colors: ['#3182bd'],
+    lineWidth: 2,
+    pointSize: 4
+  });
+
+print('--- Phase III Final Analysis ---');
+print('Calculated Otsu Threshold 2024:', otsu2024);
+print(chart);
+
+
+
+
+//////////////////////////////////
+// --- SECTION 8: EXPORT PHASE III DATA ---
+
+// 8.1 Export Annual Flood Area Statistics (CSV)
+Export.table.toDrive({
+  collection: ee.FeatureCollection(annualStats),
+  description: 'AlGash_Flood_Area_TimeSeries_2020_2025',
+  fileFormat: 'CSV',
+  selectors: ['year', 'area_m2']
+});
+
+// 8.2 Export Flood Frequency Map (Chunk 11)
+// Useful for showing "High-Risk" zones in your presentation
+Export.image.toDrive({
+  image: freq.float(),
+  description: 'AlGash_Flood_Frequency_2024',
+  folder: 'AlGash_Project',
+  region: studyArea,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+// 8.3 Export Inundation Persistence (Chunk 12)
+// Shows how many days/observations the water stayed in one spot
+Export.image.toDrive({
+  image: persistence.uint8(),
+  description: 'AlGash_Inundation_Persistence_2024',
+  folder: 'AlGash_Project',
+  region: studyArea,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+// 8.4 Export Annual Maximum Extent (Chunk 13)
+Export.image.toDrive({
+  image: maxExt.uint8(),
+  description: 'AlGash_Max_Flood_Extent_2024',
+  folder: 'AlGash_Project',
+  region: studyArea,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+print('✅ Phase III Exports Initialized: Check the Tasks tab for Frequency, Persistence, and Area Stats.');
