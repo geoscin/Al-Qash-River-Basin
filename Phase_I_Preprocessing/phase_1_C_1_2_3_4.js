@@ -6,7 +6,7 @@
  *******************************************************************************/
 
 // --- CHUNK 1: ROI Definition and Asset Ingestion ---
-var roi = ee.FeatureCollection('projects/ee-asiahamdi1/assets/Gash_basin');
+var roi = ee.FeatureCollection('projects/beaming-set-482612-c2/assets/Algash_basin_utm37');
 Map.centerObject(roi, 10);
 
 // --- CHUNK 4: Automated Cloud and Shadow Masking ---
@@ -119,5 +119,40 @@ for (var i = 0; i < years.length; i++) {
     maxPixels: 1e13
   });
 }
+// --- ADDITIONAL EXPORT: DEM & SAR DATA ---
 
+// 1. Export SRTM DEM (Topography)
+Export.image.toDrive({
+  image: elevation,
+  description: 'AlGash_DEM_SRTM_30m',
+  folder: 'AlGash_Project',
+  region: roi,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+// 2. Export SAR 2015 (Sentinel-1)
+Export.image.toDrive({
+  image: sar2015.float(),
+  description: 'AlGash_SAR_2015_VV',
+  folder: 'AlGash_Project',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+// 3. Export SAR 2025 (Sentinel-1)
+Export.image.toDrive({
+  image: sar2025.float(),
+  description: 'AlGash_SAR_2025_VV',
+  folder: 'AlGash_Project',
+  region: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+print('📡 DEM and SAR Export Tasks initialized. Check the Tasks tab.');
 print('*** PHASE I INTEGRATION COMPLETE: Console Logs & Legend Active ***');
