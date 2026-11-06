@@ -1,0 +1,208 @@
+// ================================================================================
+// LAND COVER CLASSIFICATION — ALGASH BASIN (YEAR 1985 Landsat 5 TM Baseline)
+// Features: LANDSAT/LT05/C02/T1_L2 + Core Spectral Indices
+// Classes: Bareland(0) | River(1) | Cropland(2) | Vegetation(3) | Urban(4)
+// ================================================================================
+ 
+// ── 1. SETUP & AOI ───────────────────────────────────────────────
+var roi = ee.FeatureCollection('projects/beaming-set-482612-c2/assets/Algash_basin_utm37');
+var dissolvedROI = roi.geometry().dissolve().simplify(100);
+Map.centerObject(roi, 10);
+Map.setOptions('HYBRID');
+ 
+var YEAR  = 1985;          
+var SCALE = 30;            // Native spatial resolution in meters for Landsat TM
+
+var PALETTE = [
+  '#C8A96E',  // 0  Bareland
+  '#4DB6E8',  // 1  Active River
+  '#F5C518',  // 2  Cropland
+  '#2D6A4F',  // 3  Natural Vegetation
+  '#C0392B',  // 4  Urban / Built-up
+];
+var labels = ['Bareland','Active River System','Cropland','Natural Vegetation','Urban / Built-up'];
+
+// ── 2. LANDSAT 5 DATA ACQUISITION & MASKING ────────────────────────────
+// Cloud and shadow masking function for Landsat 5
+function maskL5SR(image) {
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(1 << 3).eq(0)   // Cloud Shadow
+                 .and(image.select('QA_PIXEL').bitwiseAnd(1 << 5).eq(0)); // Cloud
+  var validMask = image.select('SR_B1').gt(0);
+  return image.updateMask(qaMask).updateMask(validMask);
+}
+
+// Fetch Landsat 5 scenes for 1985
+var landsatCollection = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .filterBounds(dissolvedROI)
+  .filterDate('1985-01-01', '1985-12-31')
+  .filter(ee.Filter.lt('CLOUD_COVER', 30))
+  .map(maskL5SR);
+
+print('Verified Landsat 5 Scenes Found in the collection:', landsatCollection.size());
+
+// Create median composite (no SLC gap-filling needed for Landsat 5)
+var landsatImage = landsatCollection.median().multiply(0.0000275).add(-0.2)
+  .clip(dissolvedROI);
+
+// Generate core spectral indices
+var ndvi = landsatImage.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI');  // NIR and Red
+var mndwi = landsatImage.normalizedDifference(['SR_B2', 'SR_B5']).rename('MNDWI'); // Green and SWIR1
+var bsi = landsatImage.expression(
+  '((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))', {
+    'SWIR1': landsatImage.select('SR_B5'),
+    'RED': landsatImage.select('SR_B3'),
+    'NIR': landsatImage.select('SR_B4'),
+    'BLUE': landsatImage.select('SR_B1')
+}).rename('BSI');
+
+// Compile multi-band predictor matrix (Bands 1-5, 7 matching Landsat 5 structure)
+var stack1985 = landsatImage.select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'])
+  .addBands([ndvi, mndwi, bsi]);
+
+var featureNames = stack1985.bandNames();
+print('Landsat 5 Stack Predictor Features:', featureNames);
+ 
+// ── 3. TRAINING DATA INTEGRATION ─────────────────────────────────
+var allSamples = Highlands_Bareland.map(function(f){return f.set('LC', 0)})
+  .merge(ActiveRiverSystem.map(function(f){return f.set('LC', 1)}))
+  .merge(Cropland.map(function(f){return f.set('LC', 2)}))
+  .merge(Natural_Vegetation.map(function(f){return f.set('LC', 3)}))
+  .merge(Urban_Built_up.map(function(f){return f.set('LC', 4)}));
+ 
+print('Total training polygons:', allSamples.size());
+ 
+// Sample spectral layer responses over polygon coordinates
+var sampledData = stack1985.sampleRegions({
+  collection: allSamples,
+  properties: ['LC'],
+  scale: SCALE,
+  tileScale: 16, 
+  geometries: false
+});
+ 
+print('Total training pixels sampled:', sampledData.size());
+ 
+// ── 4. TRAIN / VALIDATION SPLIT (70 / 30) ───────────────────────
+var withRandom = sampledData.randomColumn('rand', 42);
+var trainSet   = withRandom.filter(ee.Filter.lt('rand', 0.7));
+var valSet     = withRandom.filter(ee.Filter.gte('rand', 0.7));
+ 
+print('Train pixels:', trainSet.size());
+print('Validation pixels:', valSet.size());
+ 
+// ── 5. RANDOM FOREST CLASSIFIER ──────────────────────────────────
+var rf = ee.Classifier.smileRandomForest({
+  numberOfTrees: 200,
+  variablesPerSplit: null,  
+  minLeafPopulation: 1,
+  bagFraction: 0.632,
+  seed: 42
+}).train({
+  features: trainSet,
+  classProperty: 'LC',
+  inputProperties: featureNames
+});
+ 
+// ── 6. ACCURACY ASSESSMENT ───────────────────────────────────────
+var trainPredicted = trainSet.classify(rf);
+var valPredicted   = valSet.classify(rf);
+ 
+var trainMatrix = trainPredicted.errorMatrix('LC', 'classification', [0,1,2,3,4]);
+var valMatrix   = valPredicted.errorMatrix('LC', 'classification', [0,1,2,3,4]);
+ 
+print('══════════════════════════════════════');
+print('FIELD VECTOR POINT PROFILE COUNTS');
+print('Total Composite Sample Vector Points Pool:', allSamples.size());
+print('Highlands / Bareland point count size:', Highlands_Bareland.size());
+print('Active River System channel points size:', ActiveRiverSystem.size());
+print('Cropland parcel points size:', Cropland.size());
+print('Natural Vegetation baseline size:', Natural_Vegetation.size());
+print('Urban / Built-up footprint points size:', Urban_Built_up.size());
+
+print('══════════════════════════════════════');
+print('TRAINING ACCURACY METRICS');
+print('Confusion Matrix:', trainMatrix);
+print('Overall Accuracy:', trainMatrix.accuracy());
+print('Kappa Coefficient:', trainMatrix.kappa());
+print('Producers Accuracy:', trainMatrix.producersAccuracy());
+print('Consumers Accuracy:', trainMatrix.consumersAccuracy());
+ 
+print('══════════════════════════════════════');
+print('VALIDATION ACCURACY METRICS (UNSEEN DATA)');
+print('Confusion Matrix:', valMatrix);
+print('Overall Accuracy:', valMatrix.accuracy());
+print('Kappa Coefficient:', valMatrix.kappa());
+print('Producers Accuracy:', valMatrix.producersAccuracy());
+print('Consumers Accuracy:', valMatrix.consumersAccuracy());
+ 
+// Top feature importance
+print('Feature Importance:', rf.explain());
+ 
+// ── 7. CLASSIFY THE ROI ──────────────────────────────────────────
+var classified = stack1985.classify(rf).clip(dissolvedROI);
+ 
+// ── 8. VISUALISATION ─────────────────────────────────────────────
+Map.addLayer(classified, {min:0, max:4, palette: PALETTE}, 'Land Cover Classification 1985');
+Map.addLayer(landsatImage, {bands: ['SR_B4', 'SR_B3', 'SR_B2'], min: 0.0, max: 0.3}, 'Landsat 5 RGB False Color', false);
+Map.addLayer(roi, {color:'white'}, 'AOI Boundary', true, 0.6);
+ 
+// Legend Layout Configuration
+var legend = ui.Panel({style:{position:'bottom-left', padding:'8px 12px', backgroundColor:'white'}});
+legend.add(ui.Label({value:'Land Cover — Algash Basin 1985',
+  style:{fontWeight:'bold', fontSize:'13px', margin:'0 0 6px 0'}}));
+PALETTE.forEach(function(col, i) {
+  var row = ui.Panel({layout: ui.Panel.Layout.flow('horizontal'), style:{margin:'2px 0'}});
+  row.add(ui.Label({style:{backgroundColor:col, padding:'7px', margin:'0 6px 0 0', border:'1px solid #aaa'}}));
+  row.add(ui.Label(labels[i]));
+  legend.add(row);
+});
+Map.add(legend);
+ 
+// ── 9. AREA STATISTICS & PIE CHART RENDERING ─────────────────────
+var areaStats = ee.Image.pixelArea().divide(1e6) // Convert to square kilometers (km²)
+  .addBands(classified)
+  .reduceRegion({
+    reducer: ee.Reducer.sum().group({groupField:1, groupName:'LC'}),
+    geometry: dissolvedROI,
+    scale: SCALE,
+    maxPixels: 1e13
+  });
+ 
+print('══════════════════════════════════════');
+print('Area per class (km²):', areaStats);
+
+// Client-side evaluation wrapper to safely generate the charts
+areaStats.evaluate(function(result) {
+  var values = [];
+  var chartLabels = [];
+  
+  result.groups.forEach(function(item) {
+    var areaKm2 = item.sum.toFixed(2);
+    values.push(parseFloat(areaKm2));
+    chartLabels.push(labels[item.class]);
+  });
+
+  // Construct and render chart to the console
+  var chart = ui.Chart.array.values({array: ee.Array(values), axis: 0, xLabels: chartLabels})
+    .setChartType('PieChart')
+    .setOptions({
+      title: 'Land Cover Area Distribution (km²) - ' + YEAR,
+      colors: PALETTE,
+      pieHole: 0.4
+    });
+  print(chart);
+});
+ 
+// ── 10. EXPORT ───────────────────────────────────────────────────
+Export.image.toDrive({
+  image: classified.byte(),
+  description: 'LandCover_Algash_Landsat5_RF_1985',
+  folder: 'GEE_Algash',
+  fileNamePrefix: 'LandCover_Algash_Landsat5_RF_1985',
+  region: dissolvedROI,
+  scale: SCALE,
+  crs: 'EPSG:32637',
+  maxPixels: 1e13
+});
+ 
+// ── END ────────────────────────────────================──────────
