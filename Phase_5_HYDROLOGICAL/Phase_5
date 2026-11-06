@@ -1,0 +1,104 @@
+/**
+ * PHASE V: HYDROLOGICAL DRIVERS & RELATIONSHIP MODELING
+ * ---------------------------------------------------
+ * Feature: CHIRPS Rainfall vs Morphodynamics
+ * AUTHOR: Asia Hamdi & Team
+ * ---------------------------------------------------
+ */
+//
+// 1. SETTINGS & AOI
+var roi = ee.FeatureCollection('projects/beaming-set-482612-c2/assets/Algash_basin_utm37');
+var studyArea = roi.geometry();
+
+// 2. CHUNK 17: CHIRPS PRECIPITATION TREND ANALYSIS
+var chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+  .filterBounds(studyArea)
+  .filterDate('1985-01-01', '2025-12-31')
+  .select('precipitation');
+
+// Calculate Annual Rainfall
+var years = ee.List.sequence(1985, 2025);
+var annualRain = ee.FeatureCollection(years.map(function(y) {
+  var yearStart = ee.Date.fromYMD(y, 1, 1);
+  var yearEnd = ee.Date.fromYMD(y, 12, 31);
+  var total = chirps.filterDate(yearStart, yearEnd).sum().clip(studyArea);
+  
+  var stats = total.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: studyArea,
+    scale: 5000,
+    bestEffort: true
+  });
+  
+  return ee.Feature(null, {
+    'year': y,
+    'total_rain': stats.get('precipitation'),
+    'system:time_start': yearStart.millis()
+  });
+}));
+
+// Identify Extreme Events (Z-Score > 1.5)
+var meanRain = annualRain.aggregate_mean('total_rain');
+var stdRain = annualRain.aggregate_total_sd('total_rain');
+
+var extremeEvents = annualRain.filter(ee.Filter.gt('total_rain', 
+  ee.Number(meanRain).add(ee.Number(stdRain).multiply(1.5))));
+
+print('--- CHUNK 17: RAINFALL TRENDS ---');
+print('Annual Rainfall Collection:', annualRain);
+print('Extreme Rainfall Years (High Risk):', extremeEvents.aggregate_array('year'));
+
+// 3. CHUNK 18: LAG-TIME CORRELATION (RAINFALL VS FLOOD)
+// Note: We use daily rain data to see how flood extent reacts to peaks
+var dailyRain = chirps.filterDate('2024-06-01', '2024-10-31');
+
+var rainChart = ui.Chart.image.series({
+  imageCollection: dailyRain,
+  region: studyArea,
+  reducer: ee.Reducer.mean(),
+  scale: 5000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Daily Rainfall Peaks (Flood Season 2024)',
+  vAxis: {title: 'Precipitation (mm)'},
+  hAxis: {title: 'Date'},
+  series: {0: {color: 'blue', lineWidth: 1}}
+});
+print(rainChart);
+
+// 4. CHUNK 19: INTEGRATIVE ANALYSIS (NARROWING VS FREQUENCY)
+/* Scientific Logic: If Width decreases (Phase II) AND Flood Frequency increases (Phase III), 
+   then Morphological Choking is the driver.
+*/
+
+// Mock-up of relationship linking (replace with your exported metrics)
+var relationshipStats = ee.FeatureCollection([
+  ee.Feature(null, {'Location': 'Upstream', 'Narrowing_Rate': 0.15, 'Flood_Freq_Increase': 20}),
+  ee.Feature(null, {'Location': 'Midstream', 'Narrowing_Rate': 0.45, 'Flood_Freq_Increase': 55}),
+  ee.Feature(null, {'Location': 'Downstream', 'Narrowing_Rate': 0.10, 'Flood_Freq_Increase': 15})
+]);
+
+var correlationChart = ui.Chart.feature.byFeature(relationshipStats, 'Narrowing_Rate', 'Flood_Freq_Increase')
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Correlation: Channel Narrowing vs. Flood Frequency',
+    hAxis: {title: 'Channel Narrowing Rate (Sedimentation Proxy)'},
+    vAxis: {title: 'Flood Frequency Increase (%)'},
+    trendlines: { 0: {type: 'linear', color: 'red', showR2: true} }
+  });
+print(correlationChart);
+
+// 5. EXPORT FOR PHASE VI
+Export.table.toDrive({
+  collection: annualRain,
+  description: 'AlGash_Rainfall_Trend_1985_2025',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: extremeEvents,
+  description: 'AlGash_Extreme_Rain_Events',
+  fileFormat: 'CSV'
+});
+
+print('✅ PHASE V: Hydrological Analysis Complete. Charts and Exports generated.');
